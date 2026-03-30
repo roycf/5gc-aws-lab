@@ -1,60 +1,72 @@
 # 5GC AWS Lab
 
-A **minimal, educational 5G Core** on AWS: six HTTP/JSON microservices (**NRF, AMF, AUSF, UDM, SMF, UPF**) in **Service-Based Architecture** style, running on **ECS (EC2)** behind an **internet-facing Application Load Balancer** on **HTTP port 80**.
+Minimal 5G Core lab on AWS using six Python/FastAPI network functions (**NRF, AMF, AUSF, UDM, SMF, UPF**) deployed on **ECS (EC2 launch type)** behind an internet-facing **ALB**.
 
-**Full detail:** [docs/5gc-handbook.md](docs/5gc-handbook.md) — architecture, 5G theory, threats, tests, operations.
+> Educational environment for architecture learning, security testing, and threat-model exercises.  
+> Not intended for production use.
 
-## What this repo is for
+## Highlights
 
-- Learn **control-plane + user-plane flow**: authenticate a UE → establish a PDU session → traffic via UPF (**N6** modeled as a lab HTTP forward API).
-- Run **verification tests** and **attack simulations** (e.g. auth bypass, UPF SSRF); optionally enable an **edge WAF** and compare results.
+- 5G SBA-inspired microservice topology with clear control-plane/user-plane separation.
+- Infrastructure-as-code with CloudFormation for base networking and service stack.
+- Scripted deployment, teardown, WAF toggle, and automated test runs.
+- Security-focused scenarios including auth-bypass and SSRF simulation paths.
 
-## What it is not
+## Architecture at a glance
 
-- Not a standards-complete commercial core (no full NAS, GTP-U, PFCP, etc.).
-- Not production security; some behaviors are **intentionally** simplified or exposed for teaching.
+- **Control plane:** AMF orchestrates registration/authentication and PDU session setup through AUSF/UDM/SMF.
+- **User plane (lab model):** UPF stores sessions and exposes a test forward endpoint representing N6 behavior.
+- **Service exposure:** ALB routes only AMF/UPF paths for verification and red-team style testing.
+- **Service discovery:** NRF provides registry/discovery behavior for NF interactions.
 
-## Key layout
+## Repository structure
 
-| Path | Purpose |
-|------|--------|
-| `docs/5gc-handbook.md` | Primary reference: theory, AWS design, tests, threat modeling |
-| `infra/netsec-base.yaml` | VPC, subnets, NAT, ALB, ECS cluster, Flow Logs |
-| `infra/core-services.yaml` | Six NFs on ECS, discovery, SGs, ALB rules |
-| `infra/waf-5gc-edge.yaml` | Optional WAF → ALB |
-| `services/*` | One Python/FastAPI app per NF (port **8080** in task) |
-| `scripts/` | Deploy, tests, WAF toggle, attack scripts |
+| Path | Description |
+|------|-------------|
+| `docs/5gc-handbook.md` | Complete technical handbook (theory, internals, threat model, operations) |
+| `infra/netsec-base.yaml` | VPC, subnets, NAT, ALB, ECS cluster, flow logs |
+| `infra/core-services.yaml` | ECS services/task defs, service wiring, ALB rules, SG controls |
+| `infra/waf-5gc-edge.yaml` | Optional WAF protection stack for ALB |
+| `services/` | Source for each NF (`nrf`, `amf`, `ausf`, `udm`, `smf`, `upf`) |
+| `scripts/` | Deploy/test/teardown helpers and attack simulation scripts |
 
 ## Prerequisites
 
-- **AWS account**, AWS CLI configured, permissions for CloudFormation, ECS, ECR, VPC, IAM as used in the templates.
-- **Docker Desktop** (for building and pushing images).
-- **PowerShell** (scripts are `.ps1`).
+- AWS account with permissions for CloudFormation, ECS, ECR, EC2/VPC, IAM.
+- AWS CLI configured for your target account/region.
+- Docker Desktop running (for image build and push).
+- PowerShell (project scripts are `.ps1`).
 
-## Quick start (deploy order)
+## Quick start
 
-1. **Base stack** — VPC, ALB, ECS cluster, etc.  
-   Example: create stack `netsec-base` from `infra/netsec-base.yaml` with **`CAPABILITY_NAMED_IAM`** (see [scripts/README.md](scripts/README.md)).
-
-2. **Core services** — build images, push to ECR, deploy NF stack:
+1. Deploy base infrastructure (`infra/netsec-base.yaml`) with `CAPABILITY_NAMED_IAM`.
+2. Build/push NF images and deploy services:
    ```powershell
    cd path\to\5gc-aws-lab
    .\scripts\deploy.ps1
    ```
-   Wait **2–3 minutes** for ECS tasks to become healthy.
-
-3. **Optional WAF** — separate stack; enable only when you want edge protection:
-   ```powershell
-   .\scripts\waf-toggle.ps1 -Enable
-   ```
-
-4. **Tests** — verification + attack expectations (behavior depends on WAF on/off):
+3. Wait for ECS services to become healthy (typically 2-3 minutes).
+4. Run full validation (functional tests + attack simulations):
    ```powershell
    .\scripts\run-tests.ps1
    ```
 
-More options, teardown, and manual test commands: **[scripts/README.md](scripts/README.md)**.
+## WAF modes
 
-## Security note
+- **Vulnerable mode:** WAF disabled, attack scripts are expected to succeed.
+- **Defended mode:** WAF enabled, attack scripts are expected to be blocked.
 
-Only **AMF** and **UPF** paths are exposed via the ALB in this lab design—useful for exercises, **not** a recommended production pattern. Treat credentials, cookies, and forward URLs as **lab-only**; rotate any real secrets and lock down exposure if you extend the project.
+```powershell
+.\scripts\waf-toggle.ps1 -Enable
+.\scripts\waf-toggle.ps1 -Status
+.\scripts\waf-toggle.ps1 -Disable
+```
+
+## Documentation
+
+- Primary guide: [`docs/5gc-handbook.md`](docs/5gc-handbook.md)
+- Scripts and operational notes: [`scripts/README.md`](scripts/README.md)
+
+## Security notice
+
+This repository intentionally includes insecure-by-design behaviors for training and assessment. Do not reuse as-is for production 5G core or internet-exposed telecom workloads.

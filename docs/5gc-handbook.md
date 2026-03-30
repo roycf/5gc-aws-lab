@@ -483,6 +483,3 @@ Keep **`netsec-base`**, **`core-services`**, and **`waf-5gc`** consistent with y
 
 ---
 
-## Document history
-
-This handbook subsumes the earlier “single short document” version: it adds **repository layout**, **deep-dive theory**, **per-NF behaviors**, **AWS details**, **extended threats (04–06)**, and **threat-modeling scaffolding** suitable for building a formal **5GC-on-AWS** threat model.
