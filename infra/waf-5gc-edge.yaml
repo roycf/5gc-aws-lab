@@ -1,0 +1,99 @@
+# Optional WAF stack: attach to the 5GC ALB to enable edge defenses.
+# Deploy = WAF active (auth cookie required, SSRF blocked). Delete stack = WAF off.
+# Prerequisite: Base stack (netsec-base) deployed; pass its AlbArn output.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Optional WAF for 5GC lab - auth-before-PDU, block SSRF; activate/deactivate by deploying or deleting this stack.
+
+Parameters:
+  AlbArn:
+    Type: String
+    Description: ARN of the ALB to protect (e.g. from netsec-base stack output AlbArn)
+
+Resources:
+  WafWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${AWS::StackName}-edge"
+      Scope: REGIONAL
+      Description: 5GC edge protection - require auth cookie for PDU session, block metadata SSRF via forward API
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}-edge"
+      Rules:
+        # Block PDU session establishment unless client has 5gc-auth cookie (set after registration)
+        - Name: BlockPduWithoutAuthCookie
+          Priority: 1
+          Action: { Block: {} }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: BlockPduWithoutAuthCookie
+          Statement:
+            AndStatement:
+              Statements:
+                - ByteMatchStatement:
+                    SearchString: "namf-comm/v1/pdu-sessions"
+                    FieldToMatch: { UriPath: {} }
+                    TextTransformations: [{ Priority: 0, Type: NONE }]
+                    PositionalConstraint: CONTAINS
+                - ByteMatchStatement:
+                    SearchString: "POST"
+                    FieldToMatch: { Method: {} }
+                    TextTransformations: [{ Priority: 0, Type: NONE }]
+                    PositionalConstraint: EXACTLY
+                - NotStatement:
+                    Statement:
+                      ByteMatchStatement:
+                        SearchString: "5gc-auth="
+                        FieldToMatch: { SingleHeader: { Name: cookie } }
+                        TextTransformations: [{ Priority: 0, Type: NONE }]
+                        PositionalConstraint: CONTAINS
+        # Block UPF forward when body targets link-local metadata endpoints (SSRF)
+        # This keeps normal HTTPS internet access possible, while preventing abuse of the forward API
+        # to reach sensitive instance/task metadata IPs.
+        - Name: BlockForwardMetadataSsrF
+          Priority: 2
+          Action: { Block: {} }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: BlockForwardMetadataSsrF
+          Statement:
+            AndStatement:
+              Statements:
+                - ByteMatchStatement:
+                    SearchString: "nupf-dp/v1/forward"
+                    FieldToMatch: { UriPath: {} }
+                    TextTransformations: [{ Priority: 0, Type: NONE }]
+                    PositionalConstraint: CONTAINS
+                - ByteMatchStatement:
+                    SearchString: "POST"
+                    FieldToMatch: { Method: {} }
+                    TextTransformations: [{ Priority: 0, Type: NONE }]
+                    PositionalConstraint: EXACTLY
+                - OrStatement:
+                    Statements:
+                      - ByteMatchStatement:
+                          SearchString: "169.254.169.254"
+                          FieldToMatch: { Body: {} }
+                          TextTransformations: [{ Priority: 0, Type: NONE }]
+                          PositionalConstraint: CONTAINS
+                      - ByteMatchStatement:
+                          SearchString: "169.254.170.2"
+                          FieldToMatch: { Body: {} }
+                          TextTransformations: [{ Priority: 0, Type: NONE }]
+                          PositionalConstraint: CONTAINS
+
+  WafWebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref AlbArn
+      WebACLArn: !GetAtt WafWebAcl.Arn
+
+Outputs:
+  WafWebAclArn:
+    Value: !GetAtt WafWebAcl.Arn
+    Description: ARN of the Web ACL (for reference or logging)

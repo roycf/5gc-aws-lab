@@ -1,0 +1,574 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: 5GC NFs (NRF, AMF, AUSF, UDM, SMF, UPF) on ECS/EC2 with SG microsegmentation + ALB routing
+
+Parameters:
+  ClusterName: { Type: String }
+  VpcId: { Type: AWS::EC2::VPC::Id }
+  Subnet1: { Type: AWS::EC2::Subnet::Id }
+  Subnet2: { Type: AWS::EC2::Subnet::Id }
+  UpfSubnet1: { Type: AWS::EC2::Subnet::Id }
+  UpfSubnet2: { Type: AWS::EC2::Subnet::Id }
+  AlbListenerArn: { Type: String }
+  AlbSG: { Type: AWS::EC2::SecurityGroup::Id }
+  ECSInstanceSG: { Type: AWS::EC2::SecurityGroup::Id }
+
+  NrfImage: { Type: String }
+  AmfImage: { Type: String }
+  AusfImage: { Type: String }
+  UdmImage: { Type: String }
+  SmfImage: { Type: String }
+  UpfImage: { Type: String }
+
+Resources:
+
+  # ── CloudWatch Log Groups ─────────────────────────────────
+
+  LogGroupNRF:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /5gc/nrf, RetentionInDays: 3 }
+
+  LogGroupAMF:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /5gc/amf, RetentionInDays: 3 }
+
+  LogGroupAUSF:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /5gc/ausf, RetentionInDays: 3 }
+
+  LogGroupUDM:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /5gc/udm, RetentionInDays: 3 }
+
+  LogGroupSMF:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /5gc/smf, RetentionInDays: 3 }
+
+  LogGroupUPF:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /5gc/upf, RetentionInDays: 3 }
+
+  # ── IAM ────────────────────────────────────────────────────
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # ── Cloud Map namespace ────────────────────────────────────
+
+  Namespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: core.local
+      Vpc: !Ref VpcId
+
+  # ── Security Groups (one per NF = microsegmentation) ───────
+
+  NrfSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NRF - accepts from AMF, AUSF, UDM, SMF, UPF
+      VpcId: !Ref VpcId
+
+  AmfSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AMF - accepts from ALB only
+      VpcId: !Ref VpcId
+
+  AusfSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AUSF - accepts from AMF only
+      VpcId: !Ref VpcId
+
+  UdmSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: UDM - accepts from AUSF only
+      VpcId: !Ref VpcId
+
+  SmfSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SMF - accepts from AMF only
+      VpcId: !Ref VpcId
+
+  UpfSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: UPF - accepts from SMF (N4) and ALB (data test)
+      VpcId: !Ref VpcId
+
+  # ── Security Group Ingress Rules ───────────────────────────
+
+  # ALB -> AMF (external control-plane access)
+  InAlbToAmf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AmfSG
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSG
+
+  # ALB -> UPF (external data-plane test access)
+  InAlbToUpf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref UpfSG
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSG
+
+  # AMF -> NRF (registration, heartbeat, discovery)
+  InAmfToNrf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NrfSG
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AmfSG
+
+  # AMF -> AUSF (UE authentication)
+  InAmfToAusf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AusfSG
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AmfSG
+
+  # AMF -> SMF (PDU session creation)
+  InAmfToSmf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SmfSG
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AmfSG
+
+  # AUSF -> NRF (registration, heartbeat)
+  InAusfToNrf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NrfSG
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AusfSG
+
+  # AUSF -> UDM (fetch auth vectors)
+  InAusfToUdm:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref UdmSG
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AusfSG
+
+  # UDM -> NRF (registration, heartbeat)
+  InUdmToNrf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NrfSG
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref UdmSG
+
+  # SMF -> NRF (registration, heartbeat)
+  InSmfToNrf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NrfSG
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref SmfSG
+
+  # SMF -> UPF (N4: session programming)
+  InSmfToUpf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref UpfSG
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref SmfSG
+
+  # UPF -> NRF (registration, heartbeat)
+  InUpfToNrf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NrfSG
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref UpfSG
+
+  # ── Task Definitions (128 CPU / 256 MB each) ────────────────
+
+  NrfTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: nrf
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [EC2]
+      Cpu: "128"
+      Memory: "256"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: nrf
+          Image: !Ref NrfImage
+          PortMappings: [{ ContainerPort: 8080 }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /5gc/nrf
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: nrf
+
+  AmfTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: amf
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [EC2]
+      Cpu: "128"
+      Memory: "256"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: amf
+          Image: !Ref AmfImage
+          Environment:
+            - Name: NRF_URL
+              Value: http://nrf.core.local:8080
+            - Name: AUSF_URL
+              Value: http://ausf.core.local:8080
+            - Name: SMF_URL
+              Value: http://smf.core.local:8080
+          PortMappings: [{ ContainerPort: 8080 }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /5gc/amf
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: amf
+
+  AusfTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: ausf
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [EC2]
+      Cpu: "128"
+      Memory: "256"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: ausf
+          Image: !Ref AusfImage
+          Environment:
+            - Name: NRF_URL
+              Value: http://nrf.core.local:8080
+            - Name: UDM_URL
+              Value: http://udm.core.local:8080
+          PortMappings: [{ ContainerPort: 8080 }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /5gc/ausf
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ausf
+
+  UdmTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: udm
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [EC2]
+      Cpu: "128"
+      Memory: "256"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: udm
+          Image: !Ref UdmImage
+          Environment:
+            - Name: NRF_URL
+              Value: http://nrf.core.local:8080
+          PortMappings: [{ ContainerPort: 8080 }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /5gc/udm
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: udm
+
+  SmfTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: smf
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [EC2]
+      Cpu: "128"
+      Memory: "256"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: smf
+          Image: !Ref SmfImage
+          Environment:
+            - Name: NRF_URL
+              Value: http://nrf.core.local:8080
+            - Name: UPF_URL
+              Value: http://upf.core.local:8080
+          PortMappings: [{ ContainerPort: 8080 }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /5gc/smf
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: smf
+
+  UpfTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: upf
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [EC2]
+      Cpu: "128"
+      Memory: "256"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: upf
+          Image: !Ref UpfImage
+          Environment:
+            - Name: NRF_URL
+              Value: http://nrf.core.local:8080
+          PortMappings: [{ ContainerPort: 8080 }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /5gc/upf
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: upf
+
+  # ── Cloud Map service entries ──────────────────────────────
+
+  NrfServiceDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: nrf
+      NamespaceId: !Ref Namespace
+      DnsConfig:
+        DnsRecords: [{ Type: A, TTL: 10 }]
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  AmfServiceDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: amf
+      NamespaceId: !Ref Namespace
+      DnsConfig:
+        DnsRecords: [{ Type: A, TTL: 10 }]
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  AusfServiceDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: ausf
+      NamespaceId: !Ref Namespace
+      DnsConfig:
+        DnsRecords: [{ Type: A, TTL: 10 }]
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  UdmServiceDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: udm
+      NamespaceId: !Ref Namespace
+      DnsConfig:
+        DnsRecords: [{ Type: A, TTL: 10 }]
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  SmfServiceDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: smf
+      NamespaceId: !Ref Namespace
+      DnsConfig:
+        DnsRecords: [{ Type: A, TTL: 10 }]
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  UpfServiceDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: upf
+      NamespaceId: !Ref Namespace
+      DnsConfig:
+        DnsRecords: [{ Type: A, TTL: 10 }]
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  # ── ECS Services ───────────────────────────────────────────
+
+  NrfService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ClusterName
+      DesiredCount: 1
+      LaunchType: EC2
+      TaskDefinition: !Ref NrfTaskDef
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref Subnet1, !Ref Subnet2]
+          SecurityGroups: [!Ref NrfSG]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt NrfServiceDiscovery.Arn
+
+  UdmService:
+    Type: AWS::ECS::Service
+    DependsOn: NrfService
+    Properties:
+      Cluster: !Ref ClusterName
+      DesiredCount: 1
+      LaunchType: EC2
+      TaskDefinition: !Ref UdmTaskDef
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref Subnet1, !Ref Subnet2]
+          SecurityGroups: [!Ref UdmSG]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt UdmServiceDiscovery.Arn
+
+  UpfService:
+    Type: AWS::ECS::Service
+    DependsOn: NrfService
+    Properties:
+      Cluster: !Ref ClusterName
+      DesiredCount: 1
+      LaunchType: EC2
+      TaskDefinition: !Ref UpfTaskDef
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref UpfSubnet1, !Ref UpfSubnet2]
+          SecurityGroups: [!Ref UpfSG]
+      LoadBalancers:
+        - ContainerName: upf
+          ContainerPort: 8080
+          TargetGroupArn: !Ref UpfTargetGroup
+      ServiceRegistries:
+        - RegistryArn: !GetAtt UpfServiceDiscovery.Arn
+
+  AusfService:
+    Type: AWS::ECS::Service
+    DependsOn: UdmService
+    Properties:
+      Cluster: !Ref ClusterName
+      DesiredCount: 1
+      LaunchType: EC2
+      TaskDefinition: !Ref AusfTaskDef
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref Subnet1, !Ref Subnet2]
+          SecurityGroups: [!Ref AusfSG]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt AusfServiceDiscovery.Arn
+
+  SmfService:
+    Type: AWS::ECS::Service
+    DependsOn: UpfService
+    Properties:
+      Cluster: !Ref ClusterName
+      DesiredCount: 1
+      LaunchType: EC2
+      TaskDefinition: !Ref SmfTaskDef
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref Subnet1, !Ref Subnet2]
+          SecurityGroups: [!Ref SmfSG]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt SmfServiceDiscovery.Arn
+
+  AmfTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+
+  UpfTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+
+  AmfService:
+    Type: AWS::ECS::Service
+    DependsOn: [AusfService, SmfService]
+    Properties:
+      Cluster: !Ref ClusterName
+      DesiredCount: 1
+      LaunchType: EC2
+      TaskDefinition: !Ref AmfTaskDef
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref Subnet1, !Ref Subnet2]
+          SecurityGroups: [!Ref AmfSG]
+      LoadBalancers:
+        - ContainerName: amf
+          ContainerPort: 8080
+          TargetGroupArn: !Ref AmfTargetGroup
+      ServiceRegistries:
+        - RegistryArn: !GetAtt AmfServiceDiscovery.Arn
+
+  # ── ALB Listener Rules ────────────────────────────────────
+
+  AlbRuleAmf:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbListenerArn
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: ["/attach", "/health", "/namf-comm/*"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref AmfTargetGroup
+
+  AlbRuleUpf:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbListenerArn
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: ["/nupf-dp/*"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref UpfTargetGroup
+
+Outputs:
+  NrfSG: { Value: !Ref NrfSG }
+  AmfSG: { Value: !Ref AmfSG }
+  AusfSG: { Value: !Ref AusfSG }
+  UdmSG: { Value: !Ref UdmSG }
+  SmfSG: { Value: !Ref SmfSG }
+  UpfSG: { Value: !Ref UpfSG }
